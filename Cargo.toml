@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["shadow3 <shadow3aaaa@gmail.com>"]
 description = "A simple tool to enhance visibility in dark environments in games"
+license = "GPL-3.0-only"
+repository = "https://github.com/shadow3aaaa/ban-shadow"
 
 [dependencies]
 anyhow = "1.0.100"
