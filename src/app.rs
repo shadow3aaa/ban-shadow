@@ -1,15 +1,36 @@
-use std::{sync::Arc, thread, time::Duration};
+use std::{ffi::CString, sync::Arc, thread, time::Duration};
 
 use raw_window_handle::HasWindowHandle;
-use wgpu::{RenderPipelineDescriptor, include_wgsl};
 use windows::Win32::{
-    Foundation::HWND,
+    Foundation::{HMODULE, HWND},
+    Graphics::{
+        Direct3D::{
+            D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
+            D3D_FEATURE_LEVEL_11_1, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+            Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile},
+        },
+        Direct3D11::{
+            D3D11_COMPARISON_FUNC, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_SAMPLER_DESC, D3D11_SDK_VERSION,
+            D3D11_TEXTURE_ADDRESS_CLAMP, D3D11_VIEWPORT, D3D11CreateDevice, ID3D11Device,
+            ID3D11DeviceContext, ID3D11PixelShader, ID3D11RenderTargetView, ID3D11SamplerState,
+            ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11VertexShader,
+        },
+        Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC},
+        Dxgi::{
+            DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+            DXGI_SWAP_CHAIN_FULLSCREEN_DESC, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter, IDXGIDevice, IDXGIFactory2,
+            IDXGIKeyedMutex, IDXGISwapChain1,
+        },
+    },
     UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
         SWP_NOMOVE, SWP_NOSIZE, SetWindowDisplayAffinity, SetWindowLongPtrW, SetWindowPos,
         WDA_EXCLUDEFROMCAPTURE, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     },
 };
+use windows::core::{Interface, PCSTR};
 use windows_capture::settings::{
     ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
     MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings as CaptureSettings,
@@ -21,300 +42,167 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
-use crate::capture::{CaptureBuffer, Capturer};
+use crate::capture::{CaptureBuffer, Capturer, SharedHandle};
+
+const SHADER_SOURCE: &str = include_str!("shader.hlsl");
 
 struct App {
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    // Rendering resources
-    last_frame_id: u64,
-    local_buffer: Vec<u8>,
     capture_buffer: CaptureBuffer,
-    render_pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
-    bind_group_layout: wgpu::BindGroupLayout,
-    texture: wgpu::Texture,
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    swapchain: IDXGISwapChain1,
+    rtv: ID3D11RenderTargetView,
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    sampler: ID3D11SamplerState,
+    shared_handle: Option<SharedHandle>,
+    shared_texture: Option<ID3D11Texture2D>,
+    shared_srv: Option<ID3D11ShaderResourceView>,
+    shared_mutex: Option<IDXGIKeyedMutex>,
+    shared_size: (u32, u32),
+    last_frame_id: u64,
+    size: winit::dpi::PhysicalSize<u32>,
 }
 
 impl App {
     async fn new(window: Arc<Window>, capture_buffer: CaptureBuffer) -> Self {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
-        });
-        let surface = instance.create_surface(window.clone()).unwrap();
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .unwrap();
-        let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb()) // Prefer sRGB format
-            .unwrap_or(surface_caps.formats[0]);
-        let alpha_mode = surface_caps
-            .alpha_modes
-            .iter()
-            .find(|&&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
-            .copied()
-            .unwrap_or(wgpu::CompositeAlphaMode::Auto);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::Immediate,
-            alpha_mode,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 1, // Minimize latency
-        };
-        let texture_size = wgpu::Extent3d {
-            width: size.width,
-            height: size.height,
-            depth_or_array_layers: 1,
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Overlay Texture"),
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Bgra8UnormSrgb, // Match capture format
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        let shader = device.create_shader_module(include_wgsl!("shader.wgsl"));
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    // Texture
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    // Sampler
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-            label: Some("texture_bind_group_layout"),
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-            label: Some("texture_bind_group"),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            ..Default::default()
-        });
-        let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let local_buffer = Vec::new();
+        let hwnd = window_to_hwnd(&window).expect("Failed to get HWND");
+        let (device, context) = create_d3d_device().expect("Failed to create D3D11 device");
+        let swapchain = create_swapchain(&device, hwnd, size).expect("Failed to create swapchain");
+        let rtv = create_render_target_view(&device, &swapchain)
+            .expect("Failed to create render target view");
+        let (vs, ps) = create_shaders(&device).expect("Failed to create shaders");
+        let sampler = create_sampler(&device).expect("Failed to create sampler");
 
-        Self {
+        let app = Self {
             window,
-            surface,
-            device,
-            queue,
-            config,
-            size,
-            local_buffer,
             capture_buffer,
-            render_pipeline,
-            bind_group,
-            bind_group_layout,
-            texture,
+            device,
+            context,
+            swapchain,
+            rtv,
+            vs,
+            ps,
+            sampler,
+            shared_handle: None,
+            shared_texture: None,
+            shared_srv: None,
+            shared_mutex: None,
+            shared_size: (0, 0),
             last_frame_id: 0,
+            size,
+        };
+        app.set_viewport(size);
+        app
+    }
+
+    fn set_viewport(&self, size: winit::dpi::PhysicalSize<u32>) {
+        let viewport = D3D11_VIEWPORT {
+            TopLeftX: 0.0,
+            TopLeftY: 0.0,
+            Width: size.width as f32,
+            Height: size.height as f32,
+            MinDepth: 0.0,
+            MaxDepth: 1.0,
+        };
+        unsafe {
+            self.context.RSSetViewports(Some(&[viewport]));
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-            // Recreate texture with new size
-            let texture_size = wgpu::Extent3d {
-                width: new_size.width,
-                height: new_size.height,
-                depth_or_array_layers: 1,
-            };
-            self.texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("Overlay Texture"),
-                size: texture_size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Bgra8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            // Update bind group to use the new texture view
-            let texture_view = self
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
-            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.device.create_sampler(
-                            &wgpu::SamplerDescriptor {
-                                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                                mag_filter: wgpu::FilterMode::Linear,
-                                min_filter: wgpu::FilterMode::Linear,
-                                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                                ..Default::default()
-                            },
-                        )),
-                    },
-                ],
-                label: Some("texture_bind_group"),
-            });
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
         }
+        self.size = new_size;
+        unsafe {
+            let _ = self.swapchain.ResizeBuffers(
+                0,
+                new_size.width,
+                new_size.height,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                DXGI_SWAP_CHAIN_FLAG(0),
+            );
+        }
+        self.rtv = create_render_target_view(&self.device, &self.swapchain).expect("RTV resize");
+        self.set_viewport(new_size);
     }
 
     fn render(&mut self) {
-        // Upload captured frame to texture
+        let (handle, width, height, frame_id) = {
+            let shared = self.capture_buffer.lock().unwrap();
+            (shared.handle, shared.width, shared.height, shared.frame_id)
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+        if frame_id == self.last_frame_id {
+            return;
+        }
+        if (self.shared_handle != Some(handle) || self.shared_size != (width, height))
+            && let Err(err) = self.open_shared_texture(handle, width, height)
         {
-            let mut shared = self.capture_buffer.lock().unwrap();
-            if shared.frame_id > self.last_frame_id && !shared.buffer.is_empty() {
-                if self.local_buffer.len() != shared.buffer.len() {
-                    self.local_buffer.resize(shared.buffer.len(), 0);
-                }
-                std::mem::swap(&mut shared.buffer, &mut self.local_buffer);
-                self.last_frame_id = shared.frame_id;
-            }
+            eprintln!("Failed to open shared texture: {err:?}");
+            return;
         }
-        let expected_size = (self.size.width * self.size.height * 4) as usize;
-        if self.local_buffer.len() != expected_size {
-            return; // Skip if buffer size is not initialized yet
-        }
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfoBase {
-                texture: &self.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.local_buffer,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * self.size.width),
-                rows_per_image: Some(self.size.height),
-            },
-            wgpu::Extent3d {
-                width: self.size.width,
-                height: self.size.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        let Some(shared_srv) = &self.shared_srv else {
+            return;
+        };
+        let Some(shared_mutex) = &self.shared_mutex else {
+            return;
+        };
 
-        // Render to the surface
-        let output = self.surface.get_current_texture().unwrap();
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.bind_group, &[]);
-            render_pass.draw(0..3, 0..1); // Fullscreen triangle
+        if unsafe { shared_mutex.AcquireSync(1, 0) }.is_err() {
+            return;
         }
-        self.queue.submit(Some(encoder.finish()));
-        output.present();
+
+        unsafe {
+            self.context
+                .OMSetRenderTargets(Some(&[Some(self.rtv.clone())]), None);
+            self.context
+                .ClearRenderTargetView(&self.rtv, &[0.0, 0.0, 0.0, 0.0]);
+            self.context.IASetInputLayout(None);
+            self.context
+                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.VSSetShader(&self.vs, None);
+            self.context.PSSetShader(&self.ps, None);
+            self.context
+                .PSSetShaderResources(0, Some(&[Some(shared_srv.clone())]));
+            self.context
+                .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+            self.context.Draw(3, 0);
+        }
+
+        let _ = unsafe { shared_mutex.ReleaseSync(0) };
+        let _ = unsafe { self.swapchain.Present(0, DXGI_PRESENT(0)) };
+        self.last_frame_id = frame_id;
+    }
+
+    fn open_shared_texture(
+        &mut self,
+        handle: SharedHandle,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<()> {
+        let mut texture: Option<ID3D11Texture2D> = None;
+        unsafe {
+            self.device.OpenSharedResource(handle.0, &mut texture)?;
+        }
+        let texture = texture.ok_or_else(|| anyhow::anyhow!("Shared texture missing"))?;
+        let mutex: IDXGIKeyedMutex = texture.cast()?;
+        let mut srv = None;
+        unsafe {
+            self.device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+        }
+        self.shared_texture = Some(texture);
+        self.shared_mutex = Some(mutex);
+        self.shared_srv = srv;
+        self.shared_handle = Some(handle);
+        self.shared_size = (width, height);
+        Ok(())
     }
 }
 
@@ -328,7 +216,6 @@ impl ApplicationHandler for AppHandler {
         if self.app.is_some() {
             return;
         }
-        // Create the overlay window
         let window = event_loop
             .create_window(
                 WindowAttributes::default()
@@ -342,9 +229,8 @@ impl ApplicationHandler for AppHandler {
             .unwrap();
         apply_click_through(&window).unwrap();
 
-        // Launch capture thread
-        let primary_monitor = Monitor::primary().unwrap(); // TODO: select monitor based on args
-        let capature_buffer = CaptureBuffer::default();
+        let primary_monitor = Monitor::primary().unwrap();
+        let capture_buffer = CaptureBuffer::default();
         let settings = CaptureSettings::new(
             primary_monitor,
             CursorCaptureSettings::WithoutCursor,
@@ -355,7 +241,7 @@ impl ApplicationHandler for AppHandler {
             ),
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
-            capature_buffer.clone(),
+            capture_buffer.clone(),
         );
         thread::Builder::new()
             .name("capture".to_string())
@@ -366,7 +252,7 @@ impl ApplicationHandler for AppHandler {
 
         self.app = Some(pollster::block_on(App::new(
             Arc::new(window),
-            capature_buffer,
+            capture_buffer,
         )));
     }
 
@@ -393,30 +279,187 @@ impl ApplicationHandler for AppHandler {
     }
 }
 
-fn apply_click_through(window: &Window) -> anyhow::Result<()> {
-    // Get the HWND from the winit window
+fn window_to_hwnd(window: &Window) -> anyhow::Result<HWND> {
     let raw_handle = window.window_handle()?.as_raw();
-    let hwnd: HWND = match raw_handle {
+    let hwnd = match raw_handle {
         raw_window_handle::RawWindowHandle::Win32(handle) => {
             HWND(handle.hwnd.get() as *mut std::ffi::c_void)
         }
         _ => return Err(anyhow::anyhow!("Not a Windows handle")),
     };
+    Ok(hwnd)
+}
+
+fn create_d3d_device() -> anyhow::Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+    let mut device = None;
+    let mut context = None;
+    let mut feature_level = D3D_FEATURE_LEVEL::default();
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            D3D_DRIVER_TYPE_HARDWARE,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            Some(&feature_levels),
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            Some(&mut feature_level),
+            Some(&mut context),
+        )?;
+    }
+    let device = device.ok_or_else(|| anyhow::anyhow!("Failed to create D3D11 device"))?;
+    let context = context.ok_or_else(|| anyhow::anyhow!("Failed to create D3D11 context"))?;
+    Ok((device, context))
+}
+
+fn create_swapchain(
+    device: &ID3D11Device,
+    hwnd: HWND,
+    size: winit::dpi::PhysicalSize<u32>,
+) -> anyhow::Result<IDXGISwapChain1> {
+    let dxgi_device: IDXGIDevice = device.cast()?;
+    let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
+    let factory: IDXGIFactory2 = unsafe { adapter.GetParent()? };
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: size.width,
+        Height: size.height,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        Stereo: false.into(),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: 2,
+        Scaling: DXGI_SCALING_STRETCH,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+        Flags: 0,
+    };
+    let swapchain = unsafe {
+        factory.CreateSwapChainForHwnd(
+            device,
+            hwnd,
+            &desc,
+            Option::<*const DXGI_SWAP_CHAIN_FULLSCREEN_DESC>::None,
+            Option::<&windows::Win32::Graphics::Dxgi::IDXGIOutput>::None,
+        )?
+    };
+    Ok(swapchain)
+}
+
+fn create_render_target_view(
+    device: &ID3D11Device,
+    swapchain: &IDXGISwapChain1,
+) -> anyhow::Result<ID3D11RenderTargetView> {
+    let back_buffer: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0)? };
+    let mut rtv = None;
+    unsafe {
+        device.CreateRenderTargetView(&back_buffer, None, Some(&mut rtv))?;
+    }
+    rtv.ok_or_else(|| anyhow::anyhow!("Failed to create render target view"))
+}
+
+fn create_shaders(
+    device: &ID3D11Device,
+) -> anyhow::Result<(ID3D11VertexShader, ID3D11PixelShader)> {
+    let vs_blob = compile_shader(SHADER_SOURCE, "vs_main", "vs_5_0")?;
+    let ps_blob = compile_shader(SHADER_SOURCE, "ps_main", "ps_5_0")?;
+    let mut vs = None;
+    let mut ps = None;
+    unsafe {
+        device.CreateVertexShader(blob_bytes(&vs_blob), None, Some(&mut vs))?;
+        device.CreatePixelShader(blob_bytes(&ps_blob), None, Some(&mut ps))?;
+    }
+    let vs = vs.ok_or_else(|| anyhow::anyhow!("Failed to create vertex shader"))?;
+    let ps = ps.ok_or_else(|| anyhow::anyhow!("Failed to create pixel shader"))?;
+    Ok((vs, ps))
+}
+
+fn create_sampler(device: &ID3D11Device) -> anyhow::Result<ID3D11SamplerState> {
+    let desc = D3D11_SAMPLER_DESC {
+        Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+        AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+        AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: D3D11_COMPARISON_FUNC(0),
+        BorderColor: [0.0, 0.0, 0.0, 0.0],
+        MinLOD: 0.0,
+        MaxLOD: f32::MAX,
+    };
+    let mut sampler = None;
+    unsafe {
+        device.CreateSamplerState(&desc, Some(&mut sampler))?;
+    }
+    sampler.ok_or_else(|| anyhow::anyhow!("Failed to create sampler"))
+}
+
+fn compile_shader(
+    source: &str,
+    entry: &str,
+    target: &str,
+) -> anyhow::Result<windows::Win32::Graphics::Direct3D::ID3DBlob> {
+    let entry_c = CString::new(entry)?;
+    let target_c = CString::new(target)?;
+    let mut shader = None;
+    let mut error = None;
+    let flags = D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    let result = unsafe {
+        D3DCompile(
+            source.as_ptr() as *const _,
+            source.len(),
+            None,
+            None,
+            None,
+            PCSTR::from_raw(entry_c.as_ptr() as *const u8),
+            PCSTR::from_raw(target_c.as_ptr() as *const u8),
+            flags,
+            0,
+            &mut shader,
+            Some(&mut error),
+        )
+    };
+    if let Err(err) = result {
+        let message = error
+            .as_ref()
+            .map(blob_to_string)
+            .unwrap_or_else(|| "<no shader error>".to_string());
+        return Err(anyhow::anyhow!("D3DCompile failed: {err:?} {message}"));
+    }
+    shader.ok_or_else(|| anyhow::anyhow!("Shader blob missing"))
+}
+
+fn blob_bytes(blob: &windows::Win32::Graphics::Direct3D::ID3DBlob) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+    }
+}
+
+fn blob_to_string(blob: &windows::Win32::Graphics::Direct3D::ID3DBlob) -> String {
+    let bytes = blob_bytes(blob);
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+fn apply_click_through(window: &Window) -> anyhow::Result<()> {
+    let hwnd = window_to_hwnd(window)?;
     unsafe {
         let current_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let new_style = current_style
-            | WS_EX_LAYERED.0 as isize // Make layered
-            | WS_EX_TRANSPARENT.0 as isize // Make click-through
-            | WS_EX_TOPMOST.0 as isize // Force topmost
-            | WS_EX_TOOLWINDOW.0 as isize; // Don't show in alt-tab
+            | WS_EX_LAYERED.0 as isize
+            | WS_EX_TRANSPARENT.0 as isize
+            | WS_EX_TOPMOST.0 as isize
+            | WS_EX_TOOLWINDOW.0 as isize;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         SetWindowPos(
             hwnd,
-            Some(HWND_TOPMOST), // Place window at the top
+            Some(HWND_TOPMOST),
             0,
             0,
             0,
-            0, // Ignored since we're not changing size/position
+            0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         )?;
         SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;

@@ -2,21 +2,27 @@
 name = "ban-shadow"
 version = "0.1.0"
 edition = "2024"
+authors = ["shadow3 <shadow3aaaa@gmail.com>"]
+description = "A simple tool to enhance visibility in dark environments in games"
 
 [dependencies]
 anyhow = "1.0.100"
-clap = { version = "4.5.54", features = ["derive"] }
+clap = { version = "4.5.56", features = ["derive"] }
 pollster = "0.4.0"
 raw-window-handle = "0.6.2"
-wgpu = "28.0.0"
 windows-capture = "1.5.0"
 winit = "0.30.12"
 
 [dependencies.windows]
-version = "0.62.2"
+version = "0.61.3"
 features = [
     "Win32_Foundation",
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
 ]
